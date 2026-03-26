@@ -324,9 +324,10 @@ with open(settings_path, 'r', encoding='utf-8') as f:
         data = {}
 
 api_config = data.get("apiConfiguration", {})
-api_config["apiProvider"] = "anthropic"
-api_config["anthropicBaseUrl"] = f"http://127.0.0.1:{port}"
-api_config["anthropicApiKey"] = master_key
+api_config["apiProvider"] = "litellm"
+api_config["litellmBaseUrl"] = f"http://127.0.0.1:{port}"
+api_config["litellmApiKey"] = master_key
+api_config["litellmModelId"] = "claude-3-5-sonnet-20241022"
 
 data["apiConfiguration"] = api_config
 
