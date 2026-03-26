@@ -94,7 +94,6 @@ readonly PORT_MIN=4100
 readonly PORT_MAX=4200
 readonly HEALTH_TIMEOUT=30
 readonly DO_API_BASE="https://inference.do-ai.run"
-readonly PROXY_MASTER_KEY="sk-rooclaudo-$(openssl rand -hex 16)"
 
 # Guard against double-cleanup
 _CLEANUP_DONE=0
@@ -311,12 +310,12 @@ inject_roocode_settings() {
   fi
 
   # Use Python to parse JSON, update apiConfiguration, and write back
-  python - "${settings_file}" "${port}" "${PROXY_MASTER_KEY}" <<'PYEOF' || die "Failed to update RooCode settings"
+  python - "${settings_file}" "${port}" <<'PYEOF' || die "Failed to update RooCode settings"
 import json, sys, os
 
 settings_path = sys.argv[1]
 port = sys.argv[2]
-master_key = sys.argv[3]
+master_key = "sk-rooclaudo"
 
 with open(settings_path, 'r', encoding='utf-8') as f:
     try:
@@ -441,11 +440,10 @@ generate_litellm_config() {
 
   load_config
 
-  python - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
+  python - "${MODELS_CACHE}" "${DO_API_BASE}/v1" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
 import json, re, sys
 
 API_BASE = sys.argv[2]
-MASTER_KEY = sys.argv[3]
 
 with open(sys.argv[1]) as f:
     data = json.load(f)
@@ -542,7 +540,6 @@ for cc_name, do_id in entries:
 lines.append("")
 lines.append("general_settings:")
 lines.append("  drop_params: true")
-lines.append(f"  master_key: {MASTER_KEY}")
 lines.append("")
 lines.append("litellm_settings:")
 lines.append("  drop_params: true")
