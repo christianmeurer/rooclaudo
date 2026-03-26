@@ -502,11 +502,29 @@ def is_claude_sonnet_46(do_id):
         or re.search(r'sonnet-4[-.]6', base)
     )
 
+def is_claude_opus_46(do_id):
+    """Return True for claude-opus-4-6 / claude-opus-4.6 variants.
+
+    Matches model IDs containing any of:
+      - claude-opus-4  (e.g. claude-opus-4-6, claude-opus-4.6)
+      - opus-4-6
+      - opus-4.6
+    Supports 1 million input tokens, 32k output tokens, extended thinking,
+    and prompt caching.
+    """
+    base = re.sub(r'^anthropic-', '', do_id).lower()
+    return bool(
+        re.search(r'claude-opus-4', base)
+        or re.search(r'opus-4[-.]6', base)
+    )
+
 def get_model_info(do_id):
     """Return (max_input_tokens, max_output_tokens) for a given DO model ID.
 
     Context window limits sourced from DigitalOcean Gradient AI documentation:
       - claude-sonnet-4-6: 1 000 000 input tokens, 64 000 output tokens
+        (supports extended thinking and prompt caching)
+      - claude-opus-4-6: 1 000 000 input tokens, 32 000 output tokens
         (supports extended thinking and prompt caching)
       - claude-3-7-sonnet: 200 000 input tokens, 64 000 output tokens
         (supports extended output via streaming)
@@ -515,6 +533,8 @@ def get_model_info(do_id):
     """
     if is_claude_sonnet_46(do_id):
         return 1_000_000, 64000
+    if is_claude_opus_46(do_id):
+        return 1_000_000, 32000
     if is_claude_37_sonnet(do_id):
         return 200000, 64000
     return 200000, 8192
@@ -581,8 +601,9 @@ for cc_name, do_id in entries:
         continue
     seen.add(cc_name)
     max_input, max_output = get_model_info(do_id)
-    supports_thinking = is_claude_37_sonnet(do_id) or is_claude_sonnet_46(do_id)
+    supports_thinking = is_claude_37_sonnet(do_id) or is_claude_sonnet_46(do_id) or is_claude_opus_46(do_id)
     is_sonnet46 = is_claude_sonnet_46(do_id)
+    is_opus46 = is_claude_opus_46(do_id)
     lines.append(f"  - model_name: {cc_name}")
     lines.append(f"    litellm_params:")
     lines.append(f"      model: openai/{do_id}")
@@ -593,17 +614,31 @@ for cc_name, do_id in entries:
     # Prompt caching: instruct LiteLLM to add cache_control breakpoints on
     # eligible content blocks (system prompt, large user turns).
     lines.append(f"      cache_control: true")
-    # Extended thinking / high-reasoning for claude-3-7-sonnet and claude-sonnet-4-6 variants.
-    # budget_tokens=16000 for sonnet-4-6 (higher reasoning budget); 10000 for 3-7-sonnet.
+    # Extended thinking / high-reasoning for claude-3-7-sonnet, claude-sonnet-4-6,
+    # and claude-opus-4-6 variants.
+    # budget_tokens=16000 for sonnet-4-6 and opus-4-6 (higher reasoning budget);
+    # 10000 for 3-7-sonnet.
     # RooCode or the caller can override this per-request via the thinking parameter.
+    # Anthropic requires temperature=1 when thinking is enabled.
     if is_sonnet46:
         lines.append(f"      thinking:")
         lines.append(f"        type: enabled")
         lines.append(f"        budget_tokens: 16000")
-    elif supports_thinking:
+        lines.append(f"      temperature: 1.0")
+    elif is_opus46:
+        lines.append(f"      thinking:")
+        lines.append(f"        type: enabled")
+        lines.append(f"        budget_tokens: 16000")
+        lines.append(f"      temperature: 1.0")
+    elif is_claude_37_sonnet(do_id):
         lines.append(f"      thinking:")
         lines.append(f"        type: enabled")
         lines.append(f"        budget_tokens: 10000")
+        lines.append(f"      temperature: 1.0")
+    else:
+        # Non-thinking models: optimal settings for coding assistant performance
+        lines.append(f"      temperature: 0.2")
+        lines.append(f"      top_p: 0.9")
     lines.append(f"    model_info:")
     lines.append(f"      max_tokens: {max_output}")
     lines.append(f"      max_input_tokens: {max_input}")
