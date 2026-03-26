@@ -46,7 +46,7 @@
 # DEPENDENCIES
 # ────────────
 #   - bash (4.0+)
-#   - python3 (for LiteLLM and config generation)
+#   - python (for LiteLLM and config generation)
 #   - node (for setup scripts if needed)
 #   - litellm[proxy] (auto-installed into a venv on first run)
 #   - curl (for API calls and health checks)
@@ -245,14 +245,14 @@ check_deps() {
     missing=1
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    warn "Python 3 not found. Install via: brew install python3"
+  if ! command -v python >/dev/null 2>&1; then
+    warn "Python 3 not found. Install via: brew install python"
     missing=1
   fi
 
   if ! resolve_litellm >/dev/null 2>&1; then
     info "LiteLLM not found. Installing into venv at ${VENV_DIR}..."
-    python3 -m venv "${VENV_DIR}" || die "Failed to create virtual environment"
+    python -m venv "${VENV_DIR}" || die "Failed to create virtual environment"
     "${VENV_DIR}/bin/pip" install --quiet 'litellm[proxy]' || die "Failed to install LiteLLM"
     write_litellm_wrapper
     ok "LiteLLM installed in ${VENV_DIR}"
@@ -308,7 +308,7 @@ inject_roocode_settings() {
   fi
 
   # Use Python to parse JSON, update apiConfiguration, and write back
-  python3 - "${settings_file}" "${port}" "${PROXY_MASTER_KEY}" <<'PYEOF' || die "Failed to update RooCode settings"
+  python - "${settings_file}" "${port}" "${PROXY_MASTER_KEY}" <<'PYEOF' || die "Failed to update RooCode settings"
 import json, sys, os
 
 settings_path = sys.argv[1]
@@ -438,7 +438,7 @@ generate_litellm_config() {
 
   load_config
 
-  python3 - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
+  python - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
 import json, re, sys
 
 API_BASE = sys.argv[2]
@@ -734,7 +734,7 @@ cmd_models() {
     discover_models force
   fi
 
-  python3 - "${MODELS_CACHE}" <<'PYEOF' || die "Failed to parse models cache"
+  python - "${MODELS_CACHE}" <<'PYEOF' || die "Failed to parse models cache"
 import json, re, sys
 
 with open(sys.argv[1]) as f:
