@@ -1,0 +1,35 @@
+{
+  "name": "rooclaudo",
+  "version": "1.0.0",
+  "description": "Run RooCode against DigitalOcean Gradient AI — spins up a local LiteLLM proxy to bridge RooCode's Anthropic API format to DO's OpenAI-compatible endpoint.",
+  "license": "MIT",
+  "bin": {
+    "rooclaudo": "./bin/rooclaudo"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "roocode",
+    "vscode",
+    "digitalocean",
+    "gradient-ai",
+    "litellm",
+    "ai",
+    "llm",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/digitalocean/rooclaudo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/digitalocean/rooclaudo/issues"
+  },
+  "homepage": "https://github.com/digitalocean/rooclaudo#readme"
+}

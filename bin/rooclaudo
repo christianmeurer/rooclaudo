@@ -1,0 +1,845 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  rooclaudo — RooCode via DigitalOcean Gradient AI                            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# WHAT THIS SCRIPT DOES
+# ─────────────────────
+# rooclaudo lets you run RooCode (VS Code extension) against DigitalOcean's
+# Gradient AI inference endpoint instead of Anthropic's own API. It works by
+# spinning up a local LiteLLM proxy server that translates between RooCode's
+# native Anthropic API format and DO's OpenAI-compatible API format, then
+# configuring RooCode to use that local proxy.
+#
+# WHY IT EXISTS
+# ─────────────
+# RooCode expects to talk to the Anthropic API (api.anthropic.com), but
+# DigitalOcean's Gradient AI service exposes Claude models via an OpenAI-
+# compatible endpoint. LiteLLM bridges this gap by accepting Anthropic-format
+# requests from RooCode and forwarding them as OpenAI-format requests to DO.
+#
+# ARCHITECTURE
+# ────────────
+#                  ┌────────────┐         ┌────────────┐         ┌────────────┐
+#                  │  RooCode   │  ──▶    │  LiteLLM   │  ──▶    │  DO Grad.  │
+#                  │ (VS Code)  │ Anthropic│   Proxy    │ OpenAI  │  AI API    │
+#                  │            │  format  │ (localhost)│ format  │            │
+#                  └────────────┘         └────────────┘         └────────────┘
+#                       ▲                   Port 4100+             inference.
+#                       │                   127.0.0.1             do-ai.run/v1
+#                  VS Code globalStorage
+#                  settings.json injection
+#
+# WHAT HAPPENS ON EACH RUN
+# ────────────────────────
+#   1. Loads config (DO API key) from ~/.config/rooclaudo/config.env
+#   2. Discovers available Claude models from the DO /v1/models endpoint
+#      (cached for 24h in ~/.config/rooclaudo/models_cache.json)
+#   3. Generates a LiteLLM config YAML that maps model names
+#   4. Finds an available port in the 4100-4200 range
+#   5. Starts a LiteLLM proxy server on that port (backgrounded)
+#   6. Waits for the proxy health check to pass (up to 30s)
+#   7. Backs up RooCode's VS Code settings and injects the local proxy config
+#   8. Runs as a daemon, waiting for proxy to terminate or Ctrl+C
+#   9. On exit, cleanly shuts down the proxy and restores RooCode settings
+#
+# DEPENDENCIES
+# ────────────
+#   - bash (4.0+)
+#   - python3 (for LiteLLM and config generation)
+#   - node (for setup scripts if needed)
+#   - litellm[proxy] (auto-installed into a venv on first run)
+#   - curl (for API calls and health checks)
+#
+# FILES AND DIRECTORIES
+# ─────────────────────
+#   ~/.config/rooclaudo/
+#   ├── config.env              API key (chmod 600)
+#   ├── models_cache.json       Cached /v1/models response (24h TTL)
+#   ├── litellm_config.yaml     Auto-generated LiteLLM proxy config
+#   ├── litellm_wrapper.py      Python wrapper with monkey-patches
+#   ├── venv/                   Python venv with LiteLLM installed
+#   ├── instances/
+#   │   └── proxy-{port}.pid    PID files for running proxy instances
+#   └── logs/
+#       └── proxy-{port}.log    Stdout/stderr from proxy processes
+#
+# COMMANDS
+# ────────
+#   rooclaudo                   Start daemon to route RooCode via DO
+#   rooclaudo setup             Configure API key, install deps, discover models
+#   rooclaudo status            Show running proxy instances with uptime
+#   rooclaudo stop-all          Kill all running proxy instances
+#   rooclaudo models            Show DO model mappings
+#   rooclaudo version           Print version
+#   rooclaudo help              Print usage help
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly CONFIG_DIR="${HOME}/.config/rooclaudo"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.env"
+readonly MODELS_CACHE="${CONFIG_DIR}/models_cache.json"
+readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm_config.yaml"
+readonly VENV_DIR="${CONFIG_DIR}/venv"
+readonly LITELLM_WRAPPER="${CONFIG_DIR}/litellm_wrapper.py"
+readonly INSTANCES_DIR="${CONFIG_DIR}/instances"
+readonly LOGS_DIR="${CONFIG_DIR}/logs"
+readonly PORT_MIN=4100
+readonly PORT_MAX=4200
+readonly HEALTH_TIMEOUT=30
+readonly DO_API_BASE="https://inference.do-ai.run"
+readonly PROXY_MASTER_KEY="sk-rooclaudo-$(openssl rand -hex 16)"
+
+# Guard against double-cleanup
+_CLEANUP_DONE=0
+_PROXY_PID=""
+_PROXY_PORT=""
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+info() { printf '\033[34m▸\033[0m %s\n' "$1"; }
+warn() { printf '\033[33m▸\033[0m %s\n' "$1"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$1"; }
+
+ensure_dirs() {
+  mkdir -p "${CONFIG_DIR}" "${INSTANCES_DIR}" "${LOGS_DIR}"
+}
+
+# Write the Python wrapper that patches LiteLLM for DO Gradient AI compatibility
+write_litellm_wrapper() {
+  cat > "${LITELLM_WRAPPER}" <<'PYEOF'
+"""rooclaudo litellm wrapper — patches for DO Gradient AI compatibility."""
+import sys
+
+# Patch uvicorn to use asyncio instead of uvloop (uvloop broken on Python 3.14+)
+try:
+    import uvicorn.config
+    uvicorn.config.LOOP_SETUPS["uvloop"] = "uvicorn.loops.asyncio:asyncio_setup"
+except Exception:
+    pass
+
+# Patch the Anthropic pass-through adapter to exclude params that DO/Anthropic
+# rejects when forwarded via OpenAI format (e.g. context_management in interactive mode).
+# The method lives on LiteLLMMessagesToCompletionTransformationHandler, NOT AnthropicAdapter.
+try:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler as _Handler,
+    )
+
+    _orig_prepare = _Handler._prepare_completion_kwargs
+
+    def _strip_empty_text_blocks(messages):
+        if not isinstance(messages, list):
+            return messages
+        cleaned = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                cleaned.append(msg)
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if text is None or (isinstance(text, str) and text.strip() == ""):
+                            continue
+                    new_content.append(block)
+                if len(new_content) == 0:
+                    # Drop messages that are effectively empty after filtering
+                    continue
+                msg = dict(msg)
+                msg["content"] = new_content
+            elif isinstance(content, str) and content.strip() == "":
+                # Drop empty string-only messages
+                continue
+            cleaned.append(msg)
+        return cleaned
+
+    # All params are keyword-only (after *), so **kwargs captures them correctly
+    def _patched_prepare(**kwargs):
+        extra_kwargs = kwargs.get("extra_kwargs") or {}
+        for drop_key in ("context_management",):
+            extra_kwargs.pop(drop_key, None)
+        kwargs["extra_kwargs"] = extra_kwargs
+        # Remove empty text blocks which Anthropic rejects
+        if "messages" in kwargs:
+            kwargs["messages"] = _strip_empty_text_blocks(kwargs.get("messages"))
+        system = kwargs.get("system")
+        if isinstance(system, list):
+            new_system = []
+            for block in system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if text is None or (isinstance(text, str) and text.strip() == ""):
+                        continue
+                new_system.append(block)
+            kwargs["system"] = new_system if new_system else None
+        elif isinstance(system, str) and system.strip() == "":
+            kwargs["system"] = None
+        return _orig_prepare(**kwargs)
+
+    _Handler._prepare_completion_kwargs = staticmethod(_patched_prepare)
+
+    # Prevent routing to OpenAI Responses API for DO models.
+    # LiteLLM detects openai/ prefix + thinking params and prefixes model with
+    # "responses/" to use OpenAI's Responses API. DO doesn't support this.
+    _orig_route = _Handler._route_openai_thinking_to_responses_api_if_needed
+
+    def _patched_route(completion_kwargs, *, thinking=None):
+        model = completion_kwargs.get("model", "")
+        if isinstance(model, str) and "anthropic" in model:
+            return  # skip responses API routing for DO Anthropic models
+        return _orig_route(completion_kwargs, thinking=thinking)
+
+    _Handler._route_openai_thinking_to_responses_api_if_needed = staticmethod(_patched_route)
+except Exception as e:
+    print(f"[rooclaudo] WARNING: failed to patch adapter: {e}", file=sys.stderr)
+
+from litellm.proxy.proxy_cli import run_server
+run_server()
+PYEOF
+}
+
+# Returns the path to the litellm binary (venv or system)
+resolve_litellm() {
+  if [[ -x "${VENV_DIR}/bin/python" ]] && [[ -f "${LITELLM_WRAPPER}" ]]; then
+    echo "wrapper"
+    return 0
+  elif [[ -x "${VENV_DIR}/bin/litellm" ]]; then
+    echo "${VENV_DIR}/bin/litellm"
+    return 0
+  elif command -v litellm >/dev/null 2>&1; then
+    command -v litellm
+    return 0
+  fi
+  return 1
+}
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+load_config() {
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+  fi
+}
+
+save_config() {
+  printf '# rooclaudo configuration — generated %s\nDO_GRADIENT_API_KEY=%q\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DO_GRADIENT_API_KEY:-}" > "${CONFIG_FILE}"
+  chmod 600 "${CONFIG_FILE}"
+}
+
+# ── Dependency Checks ────────────────────────────────────────────────────────
+
+check_deps() {
+  local missing=0
+
+  if ! command -v node >/dev/null 2>&1; then
+    warn "Node.js not found. Install via: brew install node  (or https://nodejs.org)"
+    missing=1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "Python 3 not found. Install via: brew install python3"
+    missing=1
+  fi
+
+  if ! resolve_litellm >/dev/null 2>&1; then
+    info "LiteLLM not found. Installing into venv at ${VENV_DIR}..."
+    python3 -m venv "${VENV_DIR}" || die "Failed to create virtual environment"
+    "${VENV_DIR}/bin/pip" install --quiet 'litellm[proxy]' || die "Failed to install LiteLLM"
+    write_litellm_wrapper
+    ok "LiteLLM installed in ${VENV_DIR}"
+  fi
+
+  if [[ $missing -eq 1 ]]; then
+    die "Missing dependencies. Install them and try again."
+  fi
+}
+
+# ── RooCode Configuration ────────────────────────────────────────────────────
+
+find_vscode_global_storage_path() {
+  local os_name
+  os_name=$(uname -s)
+  
+  if [[ "${os_name}" == "Darwin" ]]; then
+    echo "${HOME}/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline"
+  elif [[ "${os_name}" == "Linux" ]]; then
+    echo "${HOME}/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline"
+  elif [[ "${os_name}" == *"MINGW"* ]] || [[ "${os_name}" == *"CYGWIN"* ]] || [[ "${os_name}" == *"MSYS"* ]]; then
+    # Windows git bash
+    if [[ -n "${APPDATA:-}" ]]; then
+      # Convert windows path to bash path if needed or just use it (Python will handle it later)
+      # But bash might need it to exist
+      echo "${APPDATA}/Code/User/globalStorage/rooveterinaryinc.roo-cline" | sed 's/\\/\//g'
+    else
+      echo "${HOME}/AppData/Roaming/Code/User/globalStorage/rooveterinaryinc.roo-cline"
+    fi
+  else
+    echo "${HOME}/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline"
+  fi
+}
+
+inject_roocode_settings() {
+  local port="$1"
+  local storage_dir
+  storage_dir=$(find_vscode_global_storage_path)
+  local settings_file="${storage_dir}/settings.json"
+  local backup_file="${storage_dir}/settings.json.rooclaudo.bak"
+
+  if [[ ! -d "${storage_dir}" ]]; then
+    # Try to create it, if RooCode was just installed but never used
+    mkdir -p "${storage_dir}" || die "RooCode extension directory not found at ${storage_dir}. Is RooCode installed in VS Code?"
+  fi
+
+  if [[ -f "${settings_file}" ]]; then
+    cp "${settings_file}" "${backup_file}"
+    info "Backed up RooCode settings to ${backup_file}"
+  else
+    echo "{}" > "${settings_file}"
+    info "Created empty RooCode settings file"
+  fi
+
+  # Use Python to parse JSON, update apiConfiguration, and write back
+  python3 - "${settings_file}" "${port}" "${PROXY_MASTER_KEY}" <<'PYEOF' || die "Failed to update RooCode settings"
+import json, sys, os
+
+settings_path = sys.argv[1]
+port = sys.argv[2]
+master_key = sys.argv[3]
+
+with open(settings_path, 'r', encoding='utf-8') as f:
+    try:
+        data = json.load(f)
+    except json.JSONDecodeError:
+        data = {}
+
+api_config = data.get("apiConfiguration", {})
+api_config["apiProvider"] = "anthropic"
+api_config["anthropicBaseUrl"] = f"http://127.0.0.1:{port}"
+api_config["anthropicApiKey"] = master_key
+
+data["apiConfiguration"] = api_config
+
+with open(settings_path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2)
+PYEOF
+
+  ok "Injected local proxy configuration into RooCode settings"
+}
+
+restore_roocode_settings() {
+  local storage_dir
+  storage_dir=$(find_vscode_global_storage_path)
+  local settings_file="${storage_dir}/settings.json"
+  local backup_file="${storage_dir}/settings.json.rooclaudo.bak"
+
+  if [[ -f "${backup_file}" ]]; then
+    mv "${backup_file}" "${settings_file}"
+    info "Restored original RooCode settings"
+  else
+    # If no backup exists, it means we created it from scratch
+    if [[ -f "${settings_file}" ]]; then
+      rm -f "${settings_file}"
+      info "Removed temporary RooCode settings"
+    fi
+  fi
+}
+
+
+# ── Setup ────────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+  ensure_dirs
+  info "rooclaudo setup v${VERSION}"
+  echo ""
+
+  # Ask for API key
+  local current_key=""
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    load_config
+    current_key="${DO_GRADIENT_API_KEY:-}"
+  fi
+
+  if [[ -n "${current_key}" ]]; then
+    local masked="${current_key:0:8}...${current_key: -4}"
+    printf "Current API key: %s\n" "${masked}"
+    printf "Enter new DO Gradient AI API key (or press Enter to keep current): "
+  else
+    printf "Enter your DigitalOcean Gradient AI API key: "
+  fi
+
+  read -r input_key
+  if [[ -n "${input_key}" ]]; then
+    DO_GRADIENT_API_KEY="${input_key}"
+  elif [[ -z "${current_key}" ]]; then
+    die "API key is required"
+  fi
+
+  save_config
+  ok "Config saved to ${CONFIG_FILE}"
+
+  # Check deps
+  check_deps
+
+  # Discover models
+  info "Discovering available models..."
+  discover_models force
+  ok "Setup complete! Run 'rooclaudo' to start the RooCode proxy."
+}
+
+# ── Model Discovery ─────────────────────────────────────────────────────────
+
+discover_models() {
+  local force="${1:-}"
+
+  # Check cache freshness (24h TTL)
+  if [[ "${force}" != "force" ]] && [[ -f "${MODELS_CACHE}" ]]; then
+    local cache_age
+    if [[ "$(uname)" == "Darwin" ]]; then
+      local cache_mtime
+      cache_mtime=$(stat -f %m "${MODELS_CACHE}" 2>/dev/null || echo 0)
+      local now
+      now=$(date +%s)
+      cache_age=$(( now - cache_mtime ))
+    else
+      cache_age=$(( $(date +%s) - $(stat -c %Y "${MODELS_CACHE}" 2>/dev/null || echo 0) ))
+    fi
+    if [[ ${cache_age} -lt 86400 ]]; then
+      return 0
+    fi
+  fi
+
+  load_config
+  if [[ -z "${DO_GRADIENT_API_KEY:-}" ]]; then
+    die "No API key configured. Run: rooclaudo setup"
+  fi
+
+  local response
+  response=$(curl -sf --connect-timeout 10 --max-time 30 \
+    "${DO_API_BASE}/v1/models" \
+    -H "Authorization: Bearer ${DO_GRADIENT_API_KEY}" 2>/dev/null) || die "Failed to fetch models from DO API. Check your API key and network."
+
+  echo "${response}" > "${MODELS_CACHE}"
+  generate_litellm_config
+}
+
+generate_litellm_config() {
+  if [[ ! -f "${MODELS_CACHE}" ]]; then
+    die "Models cache not found. Run: rooclaudo setup"
+  fi
+
+  load_config
+
+  python3 - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
+import json, re, sys
+
+API_BASE = sys.argv[2]
+MASTER_KEY = sys.argv[3]
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+do_models = sorted(m["id"] for m in data.get("data", []) if "claude" in m["id"].lower())
+
+if not do_models:
+    print("No Claude models found", file=sys.stderr)
+    sys.exit(1)
+
+def do_to_cc_names(do_id):
+    base = re.sub(r'^anthropic-', '', do_id)
+    normalized = base.replace('.', '-')
+
+    names = set()
+    names.add(normalized)
+
+    family_match = re.search(r'(sonnet|opus|haiku)', normalized)
+    version_match = re.findall(r'(\d+(?:-\d+)?)', normalized)
+
+    if family_match and version_match:
+        family = family_match.group(1)
+        ver_parts = '-'.join(version_match)
+        names.add(f"claude-{family}-{ver_parts}")
+        names.add(f"claude-{ver_parts}-{family}")
+
+    primary = normalized
+    aliases = sorted(names - {primary})
+    return primary, aliases
+
+entries = []
+mapped_cc_names = set()
+primary_names = set()
+
+for do_id in do_models:
+    primary, aliases = do_to_cc_names(do_id)
+    entries.append((primary, do_id))
+    mapped_cc_names.add(primary)
+    primary_names.add(primary)
+    for alias in aliases:
+        if alias not in mapped_cc_names:
+            entries.append((alias, do_id))
+            mapped_cc_names.add(alias)
+            primary_names.add(alias)
+
+family_best = {}
+for do_id in do_models:
+    base = re.sub(r'^anthropic-', '', do_id)
+    for family in ('sonnet', 'opus', 'haiku'):
+        if family in base:
+            nums = [int(x) for x in re.findall(r'(\d+)', base)]
+            ver_tuple = tuple(nums) if nums else (0,)
+            if family not in family_best or ver_tuple > family_best[family][0]:
+                family_best[family] = (ver_tuple, do_id)
+            break
+
+for family, (ver_tuple, best_do) in family_best.items():
+    for major in range(3, 6):
+        for minor in range(0, 10):
+            candidate = f"claude-{family}-{major}-{minor}"
+            if candidate not in mapped_cc_names:
+                entries.append((candidate, best_do))
+                mapped_cc_names.add(candidate)
+
+KNOWN_DATES = ["20240229", "20241022", "20250219", "20250514", "20250929", "20251001"]
+for base_name in list(primary_names):
+    do_id_for_base = None
+    for cc_name, do_id in entries:
+        if cc_name == base_name:
+            do_id_for_base = do_id
+            break
+    if do_id_for_base is None:
+        continue
+    for date in KNOWN_DATES:
+        dated = f"{base_name}-{date}"
+        if dated not in mapped_cc_names:
+            entries.append((dated, do_id_for_base))
+            mapped_cc_names.add(dated)
+
+lines = ["# Auto-generated by rooclaudo — do not edit manually", "model_list:"]
+seen = set()
+for cc_name, do_id in entries:
+    if cc_name in seen:
+        continue
+    seen.add(cc_name)
+    lines.append(f"  - model_name: {cc_name}")
+    lines.append(f"    litellm_params:")
+    lines.append(f"      model: openai/{do_id}")
+    lines.append(f"      api_key: os.environ/DO_GRADIENT_API_KEY")
+    lines.append(f"      api_base: {API_BASE}")
+    lines.append(f"      drop_params: true")
+    lines.append(f"      request_timeout: 600")
+
+lines.append("")
+lines.append("general_settings:")
+lines.append("  drop_params: true")
+lines.append(f"  master_key: {MASTER_KEY}")
+lines.append("")
+lines.append("litellm_settings:")
+lines.append("  drop_params: true")
+lines.append("  request_timeout: 600")
+
+print("\n".join(lines))
+count = len(seen)
+print(f"Generated {count} model entries", file=sys.stderr)
+PYEOF
+
+  ok "Generated LiteLLM config from /v1/models"
+}
+
+# ── Port Management ──────────────────────────────────────────────────────────
+
+cleanup_stale_pids() {
+  local pidfile
+  for pidfile in "${INSTANCES_DIR}"/proxy-*.pid; do
+    [[ -f "${pidfile}" ]] || continue
+    local content
+    content=$(cat "${pidfile}" 2>/dev/null) || continue
+    local pid
+    pid=$(echo "${content}" | cut -d: -f1)
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      rm -f "${pidfile}"
+    fi
+  done
+}
+
+find_available_port() {
+  cleanup_stale_pids
+  local port=${PORT_MIN}
+  while [[ ${port} -le ${PORT_MAX} ]]; do
+    if ! lsof -i "TCP:${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+      if [[ ! -f "${INSTANCES_DIR}/proxy-${port}.pid" ]]; then
+        echo "${port}"
+        return 0
+      fi
+    fi
+    port=$((port + 1))
+  done
+  die "No available ports in range ${PORT_MIN}-${PORT_MAX}. Run: rooclaudo stop-all"
+}
+
+# ── Proxy Lifecycle ──────────────────────────────────────────────────────────
+
+start_proxy() {
+  local port="$1"
+  local log_file="${LOGS_DIR}/proxy-${port}.log"
+
+  local litellm_mode
+  litellm_mode=$(resolve_litellm) || die "LiteLLM not found. Run: rooclaudo setup"
+
+  if [[ "${litellm_mode}" == "wrapper" ]]; then
+    DO_GRADIENT_API_KEY="${DO_GRADIENT_API_KEY}" "${VENV_DIR}/bin/python" \
+      "${LITELLM_WRAPPER}" \
+      --config "${LITELLM_CONFIG}" \
+      --host 127.0.0.1 \
+      --port "${port}" \
+      > "${log_file}" 2>&1 &
+  else
+    DO_GRADIENT_API_KEY="${DO_GRADIENT_API_KEY}" "${litellm_mode}" \
+      --config "${LITELLM_CONFIG}" \
+      --host 127.0.0.1 \
+      --port "${port}" \
+      > "${log_file}" 2>&1 &
+  fi
+
+  _PROXY_PID=$!
+  _PROXY_PORT="${port}"
+
+  # Write PID file: pid:port:parent_pid:timestamp
+  echo "${_PROXY_PID}:${port}:$$:$(date +%s)" > "${INSTANCES_DIR}/proxy-${port}.pid"
+}
+
+wait_for_proxy() {
+  local port="$1"
+  local elapsed=0
+  local url="http://127.0.0.1:${port}/health/readiness"
+
+  info "Waiting for LiteLLM proxy on port ${port}..."
+  while [[ ${elapsed} -lt ${HEALTH_TIMEOUT} ]]; do
+    if curl -sf "${url}" >/dev/null 2>&1; then
+      ok "Proxy ready on port ${port}"
+      return 0
+    fi
+    if [[ -n "${_PROXY_PID}" ]] && ! kill -0 "${_PROXY_PID}" 2>/dev/null; then
+      echo ""
+      warn "Proxy exited unexpectedly. Log output:"
+      tail -20 "${LOGS_DIR}/proxy-${port}.log" 2>/dev/null || true
+      die "LiteLLM proxy failed to start"
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  die "Proxy health check timed out after ${HEALTH_TIMEOUT}s"
+}
+
+cleanup() {
+  if [[ ${_CLEANUP_DONE} -eq 1 ]]; then
+    return
+  fi
+  _CLEANUP_DONE=1
+
+  restore_roocode_settings
+
+  if [[ -n "${_PROXY_PID}" ]]; then
+    kill "${_PROXY_PID}" 2>/dev/null || true
+    local waited=0
+    while [[ ${waited} -lt 3 ]] && kill -0 "${_PROXY_PID}" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 "${_PROXY_PID}" 2>/dev/null; then
+      kill -9 "${_PROXY_PID}" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ -n "${_PROXY_PORT}" ]]; then
+    rm -f "${INSTANCES_DIR}/proxy-${_PROXY_PORT}.pid"
+  fi
+}
+
+# ── Subcommands ──────────────────────────────────────────────────────────────
+
+cmd_status() {
+  ensure_dirs
+  cleanup_stale_pids
+  local found=0
+  local pidfile
+  for pidfile in "${INSTANCES_DIR}"/proxy-*.pid; do
+    [[ -f "${pidfile}" ]] || continue
+    local content
+    content=$(cat "${pidfile}" 2>/dev/null) || continue
+    local pid port parent_pid start_ts
+    pid=$(echo "${content}" | cut -d: -f1)
+    port=$(echo "${content}" | cut -d: -f2)
+    parent_pid=$(echo "${content}" | cut -d: -f3)
+    start_ts=$(echo "${content}" | cut -d: -f4)
+
+    local uptime_str="unknown"
+    if [[ -n "${start_ts}" ]]; then
+      local now
+      now=$(date +%s)
+      local elapsed=$(( now - start_ts ))
+      local mins=$(( elapsed / 60 ))
+      local secs=$(( elapsed % 60 ))
+      uptime_str="${mins}m${secs}s"
+    fi
+
+    printf "  PID %-8s  Port %-6s  Parent %-8s  Uptime %s\n" "${pid}" "${port}" "${parent_pid}" "${uptime_str}"
+    found=$((found + 1))
+  done
+
+  if [[ ${found} -eq 0 ]]; then
+    info "No running rooclaudo instances"
+  else
+    info "${found} instance(s) running"
+  fi
+}
+
+cmd_stop_all() {
+  ensure_dirs
+  local stopped=0
+  local pidfile
+  for pidfile in "${INSTANCES_DIR}"/proxy-*.pid; do
+    [[ -f "${pidfile}" ]] || continue
+    local content
+    content=$(cat "${pidfile}" 2>/dev/null) || continue
+    local pid
+    pid=$(echo "${content}" | cut -d: -f1)
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f "${pidfile}"
+  done
+
+  if [[ ${stopped} -eq 0 ]]; then
+    info "No running instances to stop"
+  else
+    ok "Stopped ${stopped} instance(s)"
+  fi
+}
+
+cmd_models() {
+  ensure_dirs
+  load_config
+
+  if [[ ! -f "${MODELS_CACHE}" ]]; then
+    info "No cached models. Running discovery..."
+    discover_models force
+  fi
+
+  python3 - "${MODELS_CACHE}" <<'PYEOF' || die "Failed to parse models cache"
+import json, re, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+do_models = sorted(m["id"] for m in data.get("data", []) if "claude" in m["id"].lower())
+
+def primary_cc_name(do_id):
+    base = re.sub(r'^anthropic-', '', do_id)
+    return base.replace('.', '-')
+
+print()
+print(f"{'DO Gradient Model':<40}  →  {'Model Name'}")
+print(f"{'─' * 40}     {'─' * 34}")
+for do_id in do_models:
+    cc = primary_cc_name(do_id)
+    print(f"{do_id:<40}  →  {cc}")
+PYEOF
+
+  echo ""
+  local cache_time="unknown"
+  if [[ -f "${MODELS_CACHE}" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+      cache_time=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "${MODELS_CACHE}" 2>/dev/null || echo "unknown")
+    else
+      cache_time=$(stat -c "%y" "${MODELS_CACHE}" 2>/dev/null | cut -d. -f1 || echo "unknown")
+    fi
+  fi
+  info "Cache last updated: ${cache_time}"
+  info "Run 'rooclaudo setup' to refresh"
+}
+
+cmd_version() {
+  echo "rooclaudo v${VERSION}"
+}
+
+cmd_help() {
+  cat <<EOF
+rooclaudo v${VERSION} — RooCode via DigitalOcean Gradient AI
+
+Usage:
+  rooclaudo                 Start proxy and configure RooCode
+  rooclaudo setup           Configure API key and discover models
+  rooclaudo status          Show running proxy instances
+  rooclaudo stop-all        Kill all proxy instances
+  rooclaudo models          Show discovered model mappings
+  rooclaudo version         Show version
+  rooclaudo help            Show this help
+
+Examples:
+  rooclaudo setup           First-time setup
+  rooclaudo                 Start proxy daemon
+EOF
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  ensure_dirs
+
+  # Handle subcommands
+  case "${1:-}" in
+    setup)     cmd_setup; return ;;
+    status)    cmd_status; return ;;
+    stop-all)  cmd_stop_all; return ;;
+    models)    cmd_models; return ;;
+    version)   cmd_version; return ;;
+    help|--help|-h)  cmd_help; return ;;
+  esac
+
+  # Main flow: start proxy and configure RooCode
+  load_config
+
+  if [[ -z "${DO_GRADIENT_API_KEY:-}" ]]; then
+    info "First-time setup required"
+    cmd_setup
+    load_config
+  fi
+
+  check_deps
+
+  discover_models
+
+  generate_litellm_config
+
+  if [[ -x "${VENV_DIR}/bin/python" ]]; then
+    write_litellm_wrapper
+  fi
+
+  local port
+  port=$(find_available_port)
+
+  trap cleanup EXIT INT TERM HUP
+
+  start_proxy "${port}"
+  wait_for_proxy "${port}"
+
+  # Inject RooCode settings
+  inject_roocode_settings "${port}"
+
+  info "RooCode proxy active on port ${port}."
+  info "Press Ctrl+C to exit and restore original settings."
+  
+  # Daemonize
+  wait "${_PROXY_PID}"
+}
+
+main "$@"
