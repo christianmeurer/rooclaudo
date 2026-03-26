@@ -327,7 +327,7 @@ api_config = data.get("apiConfiguration", {})
 api_config["apiProvider"] = "litellm"
 api_config["litellmBaseUrl"] = f"http://127.0.0.1:{port}"
 api_config["litellmApiKey"] = master_key
-api_config["litellmModelId"] = "claude-3-5-sonnet-20241022"
+api_config["litellmModelId"] = "claude-sonnet-4-6"
 # Enable prompt caching in RooCode so it sends cache_control breakpoints
 # on eligible content blocks (system prompt, large user turns).
 # This key is recognised by RooCode's LiteLLM provider integration.
@@ -484,15 +484,37 @@ def is_claude_37_sonnet(do_id):
     base = re.sub(r'^anthropic-', '', do_id).lower()
     return bool(re.search(r'claude-3[-.]7[-.]sonnet', base))
 
+def is_claude_sonnet_46(do_id):
+    """Return True for claude-sonnet-4-6 / claude-sonnet-4.6 variants.
+
+    Matches model IDs containing any of:
+      - claude-sonnet-4  (e.g. claude-sonnet-4-6, claude-sonnet-4.6)
+      - claude-4         (e.g. anthropic-claude-4-sonnet-*)
+      - sonnet-4-6
+      - sonnet-4.6
+    Supports 1 million input tokens, 64k output tokens, extended thinking,
+    and prompt caching.
+    """
+    base = re.sub(r'^anthropic-', '', do_id).lower()
+    return bool(
+        re.search(r'claude-sonnet-4', base)
+        or re.search(r'claude-4[-.]?\d*[-.]?sonnet', base)
+        or re.search(r'sonnet-4[-.]6', base)
+    )
+
 def get_model_info(do_id):
     """Return (max_input_tokens, max_output_tokens) for a given DO model ID.
 
     Context window limits sourced from DigitalOcean Gradient AI documentation:
+      - claude-sonnet-4-6: 1 000 000 input tokens, 64 000 output tokens
+        (supports extended thinking and prompt caching)
       - claude-3-7-sonnet: 200 000 input tokens, 64 000 output tokens
         (supports extended output via streaming)
       - claude-3-5-sonnet / all other Claude models: 200 000 input tokens,
         8 192 output tokens
     """
+    if is_claude_sonnet_46(do_id):
+        return 1_000_000, 64000
     if is_claude_37_sonnet(do_id):
         return 200000, 64000
     return 200000, 8192
@@ -559,7 +581,8 @@ for cc_name, do_id in entries:
         continue
     seen.add(cc_name)
     max_input, max_output = get_model_info(do_id)
-    supports_thinking = is_claude_37_sonnet(do_id)
+    supports_thinking = is_claude_37_sonnet(do_id) or is_claude_sonnet_46(do_id)
+    is_sonnet46 = is_claude_sonnet_46(do_id)
     lines.append(f"  - model_name: {cc_name}")
     lines.append(f"    litellm_params:")
     lines.append(f"      model: openai/{do_id}")
@@ -570,10 +593,14 @@ for cc_name, do_id in entries:
     # Prompt caching: instruct LiteLLM to add cache_control breakpoints on
     # eligible content blocks (system prompt, large user turns).
     lines.append(f"      cache_control: true")
-    # Extended thinking / high-reasoning for claude-3-7-sonnet variants.
-    # budget_tokens=10000 is a conservative default; RooCode or the caller
-    # can override this per-request via the thinking parameter.
-    if supports_thinking:
+    # Extended thinking / high-reasoning for claude-3-7-sonnet and claude-sonnet-4-6 variants.
+    # budget_tokens=16000 for sonnet-4-6 (higher reasoning budget); 10000 for 3-7-sonnet.
+    # RooCode or the caller can override this per-request via the thinking parameter.
+    if is_sonnet46:
+        lines.append(f"      thinking:")
+        lines.append(f"        type: enabled")
+        lines.append(f"        budget_tokens: 16000")
+    elif supports_thinking:
         lines.append(f"      thinking:")
         lines.append(f"        type: enabled")
         lines.append(f"        budget_tokens: 10000")
