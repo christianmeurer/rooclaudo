@@ -78,6 +78,9 @@
 
 set -euo pipefail
 
+export PYTHONIOENCODING="utf-8"
+export PYTHONUTF8="1"
+
 readonly VERSION="1.0.0"
 readonly CONFIG_DIR="${HOME}/.config/rooclaudo"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.env"
